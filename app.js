@@ -117,9 +117,13 @@ function download(blob, name) {
 }
 
 export async function shareFile(file, navigatorLike, downloadFallback) {
-  if (navigatorLike?.canShare?.({ files: [file] }) && navigatorLike?.share) {
-    await navigatorLike.share({ files: [file], title: file.name });
-    return 'shared';
+  if (navigatorLike?.share) {
+    try {
+      await navigatorLike.share({ files: [file], title: file.name });
+      return 'shared';
+    } catch (error) {
+      if (error?.name === 'AbortError') return 'cancelled';
+    }
   }
   downloadFallback();
   return 'downloaded';
