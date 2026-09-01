@@ -1,0 +1,150 @@
+export function lessonForDate(date) {
+  const monday = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const weekday = monday.getDay();
+  monday.setDate(monday.getDate() + (weekday === 0 ? -6 : 1 - weekday));
+  monday.setHours(0, 0, 0, 0);
+  const anchor = new Date(2026, 7, 31);
+  const number = 79 + Math.floor((monday - anchor) / 604800000);
+  const end = new Date(monday);
+  end.setDate(end.getDate() + 6);
+  return { number, start: monday, end };
+}
+
+export function phaseForSeconds(seconds) {
+  if (seconds >= 900) return { kind: 'complete', label: '15分钟完成，可以结束录音。' };
+  if (seconds >= 600) return { kind: 'newConcept', label: '新概念英语第二册 · 5分钟' };
+  return { kind: 'classroom', label: '课内英语 · 10分钟' };
+}
+
+export function csvCell(value) {
+  return `"${String(value ?? '').replaceAll('"', '""')}"`;
+}
+
+const DB_NAME = 'EnglishRecorderOfflineDB';
+const STORE_NAME = 'recordings';
+const META_KEY = 'englishRecorderOfflineMetaV1';
+const secondsPerDay = 900;
+const pad = (value) => String(value).padStart(2, '0');
+const localDate = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+const localMonth = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}`;
+const formatTime = (seconds) => `${pad(Math.floor(seconds / 60))}:${pad(seconds % 60)}`;
+
+function database() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(STORE_NAME)) request.result.createObjectStore(STORE_NAME, { keyPath: 'date' });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function saveAudio(record) {
+  const db = await database();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    transaction.objectStore(STORE_NAME).put(record);
+    transaction.oncomplete = resolve;
+    transaction.onerror = () => reject(transaction.error);
+  });
+}
+
+async function monthlyAudio(month) {
+  const db = await database();
+  return new Promise((resolve, reject) => {
+    const result = [];
+    const request = db.transaction(STORE_NAME, 'readonly').objectStore(STORE_NAME).openCursor();
+    request.onsuccess = (event) => {
+      const cursor = event.target.result;
+      if (cursor) {
+        if (String(cursor.key).startsWith(month)) result.push(cursor.value);
+        cursor.continue();
+      } else resolve(result.sort((a, b) => a.date.localeCompare(b.date)));
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function preferredMime() {
+  for (const mime of ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4', 'audio/webm;codecs=opus', 'audio/webm']) {
+    if (window.MediaRecorder?.isTypeSupported?.(mime)) return mime;
+  }
+  return '';
+}
+
+function extensionFor(mime) {
+  return mime.includes('mp4') || mime.includes('aac') ? 'm4a' : 'webm';
+}
+
+function download(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = name;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+function csvFor(month, meta) {
+  const header = ['日期', '是否完成', '录音时长(秒)', '录音文件名', '录音格式', '课次', '朗读进度', '朗读次数', '备注'];
+  const records = Object.keys(meta).filter((key) => key.startsWith(month)).sort().map((key) => {
+    const record = meta[key];
+    return [key, record.done ? '是' : '否', record.seconds || 0, record.audioFilename || '', record.audioFormat || '', record.lessonNumber || '', record.lessonProgress || '', record.readCount || '', record.note || ''];
+  });
+  return '\ufeff' + [header, ...records].map((row) => row.map(csvCell).join(',')).join('\n');
+}
+
+const crcTable = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) { let value = i; for (let bit = 0; bit < 8; bit += 1) value = (value & 1) ? 0xedb88320 ^ (value >>> 1) : value >>> 1; table[i] = value >>> 0; }
+  return table;
+})();
+const crc32 = (bytes) => { let value = 0xffffffff; for (const byte of bytes) value = crcTable[(value ^ byte) & 255] ^ (value >>> 8); return (value ^ 0xffffffff) >>> 0; };
+const u16 = (n) => new Uint8Array([n & 255, (n >>> 8) & 255]);
+const u32 = (n) => new Uint8Array([n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255]);
+const join = (parts) => { const out = new Uint8Array(parts.reduce((total, part) => total + part.length, 0)); let offset = 0; for (const part of parts) { out.set(part, offset); offset += part.length; } return out; };
+function dosTime(date = new Date()) { return { time: (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2), date: ((date.getFullYear() - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate() }; }
+async function zip(files) {
+  const encoder = new TextEncoder(), locals = [], central = []; let offset = 0;
+  for (const file of files) {
+    const name = encoder.encode(file.name), data = new Uint8Array(await file.blob.arrayBuffer()), checksum = crc32(data), time = dosTime();
+    const local = join([u32(0x04034b50), u16(20), u16(0), u16(0), u16(time.time), u16(time.date), u32(checksum), u32(data.length), u32(data.length), u16(name.length), u16(0), name, data]);
+    locals.push(local);
+    central.push(join([u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(time.time), u16(time.date), u32(checksum), u32(data.length), u32(data.length), u16(name.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(offset), name]));
+    offset += local.length;
+  }
+  const localData = join(locals), centralData = join(central);
+  return new Blob([localData, centralData, join([u32(0x06054b50), u16(0), u16(0), u16(files.length), u16(files.length), u32(centralData.length), u32(localData.length), u16(0)])], { type: 'application/zip' });
+}
+
+function init() {
+  const today = new Date(), todayKey = localDate(today), currentMonth = localMonth(today), lesson = lessonForDate(today);
+  const $ = (id) => document.getElementById(id);
+  const elements = ['todayText', 'outsideTask', 'lessonNum', 'weekRange', 'timer', 'bar', 'phase', 'status', 'start', 'pause', 'stop', 'player', 'saveBox', 'fileInfo', 'downloadAudio', 'lessonProgress', 'readCount', 'note', 'saveRecord', 'calendar', 'monthList', 'packMonth', 'packBtn', 'packStatus', 'exportCsv', 'secureWarn'].reduce((all, id) => ({ ...all, [id]: $(id) }), {});
+  let meta = JSON.parse(localStorage.getItem(META_KEY) || '{}');
+  let recorder, stream, chunks = [], elapsed = 0, startedAt = 0, tick, paused = false, audioUrl;
+  elements.todayText.textContent = `${today.getFullYear()}年${today.getMonth() + 1}月${today.getDate()}日 · 课内10分钟 + Lesson ${lesson.number} 5分钟`;
+  elements.outsideTask.textContent = `新概念英语第二册 · Lesson ${lesson.number}`;
+  elements.lessonNum.textContent = `Lesson ${lesson.number}`;
+  elements.weekRange.textContent = `${localDate(lesson.start)} ～ ${localDate(lesson.end)}`;
+  elements.packMonth.value = currentMonth;
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { elements.secureWarn.classList.remove('hidden'); elements.start.disabled = true; }
+  if (meta[todayKey]) { elements.lessonProgress.value = meta[todayKey].lessonProgress || ''; elements.readCount.value = meta[todayKey].readCount || ''; elements.note.value = meta[todayKey].note || ''; if (meta[todayKey].done) elements.status.textContent = '今日已完成'; }
+  const updateTimer = () => { const phase = phaseForSeconds(elapsed); elements.timer.textContent = formatTime(elapsed); elements.bar.style.width = `${Math.min(100, elapsed / secondsPerDay * 100)}%`; elements.phase.textContent = phase.label; };
+  const saveMeta = (done) => { meta[todayKey] = { ...(meta[todayKey] || {}), done: Boolean(done), seconds: elapsed, lessonNumber: lesson.number, lessonProgress: elements.lessonProgress.value.trim(), readCount: elements.readCount.value ? Number(elements.readCount.value) : '', note: elements.note.value.trim() }; localStorage.setItem(META_KEY, JSON.stringify(meta)); elements.status.textContent = done ? '今日已完成' : '已保存'; renderCalendar(); renderMonthList(); };
+  const renderCalendar = () => { const year = today.getFullYear(), month = today.getMonth(); elements.calendar.innerHTML = ''; for (let blank = 0; blank < new Date(year, month, 1).getDay(); blank += 1) elements.calendar.append(document.createElement('div')); for (let day = 1; day <= new Date(year, month + 1, 0).getDate(); day += 1) { const key = `${year}-${pad(month + 1)}-${pad(day)}`, cell = document.createElement('div'); cell.className = `day${meta[key]?.done ? ' done' : ''}`; cell.innerHTML = `<b>${day}</b><span>${meta[key]?.done ? '✅' : '—'}</span>`; elements.calendar.append(cell); } };
+  async function renderMonthList() { const audio = await monthlyAudio(currentMonth), byDate = Object.fromEntries(audio.map((record) => [record.date, record])); const keys = [...new Set([...Object.keys(meta).filter((key) => key.startsWith(currentMonth)), ...audio.map((record) => record.date)])].sort(); elements.monthList.innerHTML = keys.length ? keys.map((key) => { const record = meta[key] || {}, file = byDate[key]; return `<div class="list-row"><b>${key}</b> ${record.done ? '✅' : '⚠️'} · ${Math.floor((record.seconds || file?.seconds || 0) / 60)}分${(record.seconds || file?.seconds || 0) % 60}秒<br>${file ? `🎙 ${file.filename}` : '尚无录音文件'}</div>`; }).join('') : '暂无记录'; }
+  elements.start.addEventListener('click', async () => { try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); const mime = preferredMime(); recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream); chunks = []; recorder.addEventListener('dataavailable', (event) => { if (event.data.size) chunks.push(event.data); }); recorder.addEventListener('stop', async () => { const actualMime = recorder.mimeType || mime || 'audio/webm', blob = new Blob(chunks, { type: actualMime }), filename = `${todayKey}_英语15分钟.${extensionFor(actualMime)}`; if (audioUrl) URL.revokeObjectURL(audioUrl); audioUrl = URL.createObjectURL(blob); elements.player.src = audioUrl; elements.player.classList.remove('hidden'); await saveAudio({ date: todayKey, filename, mime: actualMime, blob, seconds: elapsed }); meta[todayKey] = { ...(meta[todayKey] || {}), audioFilename: filename, audioFormat: actualMime }; localStorage.setItem(META_KEY, JSON.stringify(meta)); elements.downloadAudio.href = audioUrl; elements.downloadAudio.download = filename; elements.fileInfo.textContent = `${filename} · ${Math.round(blob.size / 1024)}KB · ${actualMime}`; elements.saveBox.classList.remove('hidden'); renderMonthList(); }); recorder.start(); startedAt = Date.now() - elapsed * 1000; tick = setInterval(() => { elapsed = Math.floor((Date.now() - startedAt) / 1000); updateTimer(); }, 500); elements.start.disabled = true; elements.pause.disabled = false; elements.stop.disabled = false; elements.status.textContent = '录音中'; } catch (error) { alert(`无法启动麦克风：${error.message || error}`); } });
+  elements.pause.addEventListener('click', () => { if (!recorder) return; if (!paused) { recorder.pause(); clearInterval(tick); paused = true; elements.pause.textContent = '继续'; } else { recorder.resume(); startedAt = Date.now() - elapsed * 1000; tick = setInterval(() => { elapsed = Math.floor((Date.now() - startedAt) / 1000); updateTimer(); }, 500); paused = false; elements.pause.textContent = '暂停'; } });
+  elements.stop.addEventListener('click', () => { if (recorder?.state !== 'inactive') recorder.stop(); clearInterval(tick); stream?.getTracks().forEach((track) => track.stop()); elements.start.disabled = false; elements.pause.disabled = true; elements.stop.disabled = true; saveMeta(elapsed >= secondsPerDay); });
+  elements.saveRecord.addEventListener('click', () => { saveMeta(meta[todayKey]?.done || elapsed >= secondsPerDay); alert('今日记录已保存。'); });
+  elements.exportCsv.addEventListener('click', () => download(new Blob([csvFor(currentMonth, meta)], { type: 'text/csv;charset=utf-8' }), `${currentMonth}_英语录音记录.csv`));
+  elements.packBtn.addEventListener('click', async () => { const month = elements.packMonth.value; elements.packStatus.textContent = '正在生成 ZIP…'; try { const audio = await monthlyAudio(month), selected = Object.fromEntries(Object.entries(meta).filter(([key]) => key.startsWith(month))); const files = audio.map((record) => ({ name: `audio/${record.filename}`, blob: record.blob })); files.push({ name: 'record.csv', blob: new Blob([csvFor(month, meta)], { type: 'text/csv;charset=utf-8' }) }, { name: 'record.json', blob: new Blob([JSON.stringify(selected, null, 2)], { type: 'application/json' }) }); download(await zip(files), `${month}_英语录音打包.zip`); elements.packStatus.textContent = `已生成 ZIP，包含录音 ${audio.length} 个。`; } catch (error) { elements.packStatus.textContent = `打包失败：${error.message || error}`; } });
+  renderCalendar(); renderMonthList(); updateTimer();
+  if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('./service-worker.js').catch(() => {}));
+}
+
+if (typeof document !== 'undefined') init();
