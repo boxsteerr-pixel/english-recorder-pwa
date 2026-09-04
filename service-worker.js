@@ -1,5 +1,4 @@
-
-const CACHE_NAME = 'english-recorder-pwa-v5';
+const CACHE_NAME = 'english-recorder-pwa-v1';
 const SHELL = ['./', './index.html', './app.js', './manifest.webmanifest', './icons/icon.svg'];
 
 self.addEventListener('install', (event) => {
@@ -16,4 +15,3 @@ self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
   event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request)));
 });
-
