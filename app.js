@@ -16,27 +16,115 @@ export function phaseForSeconds(seconds) {
   return { kind: 'classroom', label: '课内英语 · 10分钟' };
 }
 
+export function createRecordingSession(date, lessonNumber) {
+  return { date: localDate(date), lessonNumber, seconds: 0 };
+}
+
+export function sealRecordingSession(session, seconds) {
+  return { ...session, seconds: Math.max(0, Math.floor(seconds)) };
+}
+
+export function recordingFilename(date, mime) {
+  return `${date}_英语15分钟.${extensionFor(mime)}`;
+}
+
+export function dateContext(date) {
+  return { key: localDate(date), month: localMonth(date) };
+}
+
+export function needsLegacyRepair(record) {
+  return record?.date !== '2026-09-04' || !Number(record?.seconds);
+}
+
+export function finishRecordingSession(elapsed) {
+  return { savedSeconds: elapsed, nextElapsed: 0 };
+}
+
+export function recordingStatus(state) {
+  return ({
+    idle: { text: '准备开始', tone: 'idle' },
+    recording: { text: '正在录音', tone: 'recording' },
+    paused: { text: '录音已暂停', tone: 'paused' },
+    saving: { text: '正在保存录音', tone: 'saving' },
+    saved: { text: '已保存，可重新录制', tone: 'saved' }
+  })[state] || { text: '准备开始', tone: 'idle' };
+}
+
 export function csvCell(value) {
   return `"${String(value ?? '').replaceAll('"', '""')}"`;
 }
 
+export class WakeLockController {
+  constructor(navigatorLike) {
+    this.wakeLock = navigatorLike?.wakeLock;
+    this.sentinel = null;
+  }
+
+  async acquire() {
+    if (this.sentinel) return true;
+    if (!this.wakeLock?.request) return false;
+    try {
+      this.sentinel = await this.wakeLock.request('screen');
+      this.sentinel.addEventListener?.('release', () => { this.sentinel = null; });
+      return true;
+    } catch {
+      this.sentinel = null;
+      return false;
+    }
+  }
+
+  async release() {
+    if (!this.sentinel) return false;
+    const sentinel = this.sentinel;
+    this.sentinel = null;
+    await sentinel.release();
+    return true;
+  }
+}
+
 const DB_NAME = 'EnglishRecorderOfflineDB';
-const STORE_NAME = 'recordings';
+const STORE_NAME = 'recordingsV2';
+const LEGACY_STORE_NAME = 'recordings';
 const META_KEY = 'englishRecorderOfflineMetaV1';
+const LEGACY_REPAIR_KEY = 'englishRecorderLegacyRepairV1';
+const LEGACY_REPAIR_DATE = '2026-09-04';
 const secondsPerDay = 900;
 const pad = (value) => String(value).padStart(2, '0');
 const localDate = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 const localMonth = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}`;
 const formatTime = (seconds) => `${pad(Math.floor(seconds / 60))}:${pad(seconds % 60)}`;
 
-function database() {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1);
+async function database() {
+  const db = await new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, 2);
     request.onupgradeneeded = () => {
-      if (!request.result.objectStoreNames.contains(STORE_NAME)) request.result.createObjectStore(STORE_NAME, { keyPath: 'date' });
+      if (!request.result.objectStoreNames.contains(STORE_NAME)) request.result.createObjectStore(STORE_NAME, { keyPath: 'id' });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
+  });
+  if (!localStorage.getItem(`${LEGACY_REPAIR_KEY}-store`) && db.objectStoreNames.contains(LEGACY_STORE_NAME)) {
+    const legacy = await readRecords(db, LEGACY_STORE_NAME);
+    if (legacy.length) await writeRecords(db, legacy.map((record) => ({ ...record, id: record.id || `${record.date}-${record.filename || 'audio'}` })));
+    localStorage.setItem(`${LEGACY_REPAIR_KEY}-store`, 'done');
+  }
+  return db;
+}
+
+function readRecords(db, storeName) {
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(storeName, 'readonly').objectStore(storeName).getAll();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function writeRecords(db, records) {
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    records.forEach((record) => transaction.objectStore(STORE_NAME).put(record));
+    transaction.oncomplete = resolve;
+    transaction.onerror = () => reject(transaction.error);
   });
 }
 
@@ -44,7 +132,7 @@ async function saveAudio(record) {
   const db = await database();
   return new Promise((resolve, reject) => {
     const transaction = db.transaction(STORE_NAME, 'readwrite');
-    transaction.objectStore(STORE_NAME).put(record);
+    transaction.objectStore(STORE_NAME).put({ ...record, id: record.id || `${record.date}-${record.filename || 'audio'}` });
     transaction.oncomplete = resolve;
     transaction.onerror = () => reject(transaction.error);
   });
@@ -58,12 +146,56 @@ async function monthlyAudio(month) {
     request.onsuccess = (event) => {
       const cursor = event.target.result;
       if (cursor) {
-        if (String(cursor.key).startsWith(month)) result.push(cursor.value);
+        if (String(cursor.value.date).startsWith(month)) result.push(cursor.value);
         cursor.continue();
       } else resolve(result.sort((a, b) => a.date.localeCompare(b.date)));
     };
     request.onerror = () => reject(request.error);
   });
+}
+
+async function allAudio() {
+  return readRecords(await database(), STORE_NAME);
+}
+
+function audioDuration(blob) {
+  if (typeof Audio !== 'function' || !blob) return Promise.resolve(0);
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(blob), player = new Audio();
+    const finish = (value) => { URL.revokeObjectURL(url); resolve(Number.isFinite(value) ? Math.round(value) : 0); };
+    player.onloadedmetadata = () => finish(player.duration);
+    player.onerror = () => finish(0);
+    player.src = url;
+  });
+}
+
+async function repairLegacyRecords(meta) {
+  if (localStorage.getItem(LEGACY_REPAIR_KEY)) return meta;
+  const audio = await allAudio();
+  const legacy = audio.filter(needsLegacyRepair);
+  if (!legacy.length) { localStorage.setItem(LEGACY_REPAIR_KEY, 'done'); return meta; }
+  const repaired = await Promise.all(legacy.map(async (record, index) => {
+    const mime = record.mime || record.blob?.type || 'audio/mp4';
+    const base = recordingFilename(LEGACY_REPAIR_DATE, mime);
+    const filename = legacy.length === 1 ? base : base.replace('.', `_旧录音${index + 1}.`);
+    const seconds = Number(record.seconds) || await audioDuration(record.blob);
+    return { ...record, date: LEGACY_REPAIR_DATE, filename, seconds, id: `${LEGACY_REPAIR_DATE}-legacy-${index + 1}` };
+  }));
+  const db = await database();
+  await writeRecords(db, [...audio.filter((record) => !needsLegacyRepair(record)), ...repaired]);
+  const migrated = { ...(meta[LEGACY_REPAIR_DATE] || {}) };
+  for (const [date, record] of Object.entries(meta)) {
+    if (date === LEGACY_REPAIR_DATE) continue;
+    Object.assign(migrated, record, { seconds: Number(migrated.seconds || 0) + Number(record.seconds || 0) });
+    delete meta[date];
+  }
+  migrated.seconds = Math.max(Number(migrated.seconds || 0), repaired.reduce((total, record) => total + Number(record.seconds || 0), 0));
+  migrated.done = migrated.seconds >= secondsPerDay;
+  migrated.audioFilename = repaired.map((record) => record.filename).join('、');
+  meta[LEGACY_REPAIR_DATE] = migrated;
+  localStorage.setItem(META_KEY, JSON.stringify(meta));
+  localStorage.setItem(LEGACY_REPAIR_KEY, 'done');
+  return meta;
 }
 
 function preferredMime() {
@@ -86,6 +218,19 @@ function download(blob, name) {
   anchor.click();
   anchor.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+export async function shareFile(file, navigatorLike, downloadFallback) {
+  if (navigatorLike?.share) {
+    try {
+      await navigatorLike.share({ files: [file], title: file.name });
+      return 'shared';
+    } catch (error) {
+      if (error?.name === 'AbortError') return 'cancelled';
+    }
+  }
+  downloadFallback();
+  return 'downloaded';
 }
 
 function csvFor(month, meta) {
@@ -121,29 +266,56 @@ async function zip(files) {
 }
 
 function init() {
-  const today = new Date(), todayKey = localDate(today), currentMonth = localMonth(today), lesson = lessonForDate(today);
   const $ = (id) => document.getElementById(id);
-  const elements = ['todayText', 'outsideTask', 'lessonNum', 'weekRange', 'timer', 'bar', 'phase', 'status', 'start', 'pause', 'stop', 'player', 'saveBox', 'fileInfo', 'downloadAudio', 'lessonProgress', 'readCount', 'note', 'saveRecord', 'calendar', 'monthList', 'packMonth', 'packBtn', 'packStatus', 'exportCsv', 'secureWarn'].reduce((all, id) => ({ ...all, [id]: $(id) }), {});
+  const elements = ['todayText', 'outsideTask', 'lessonNum', 'weekRange', 'timer', 'bar', 'phase', 'status', 'recordingState', 'start', 'pause', 'stop', 'player', 'saveBox', 'fileInfo', 'downloadAudio', 'lessonProgress', 'readCount', 'note', 'saveRecord', 'calendar', 'monthList', 'packMonth', 'packBtn', 'packStatus', 'exportCsv', 'secureWarn'].reduce((all, id) => ({ ...all, [id]: $(id) }), {});
   let meta = JSON.parse(localStorage.getItem(META_KEY) || '{}');
-  let recorder, stream, chunks = [], elapsed = 0, startedAt = 0, tick, paused = false, audioUrl;
-  elements.todayText.textContent = `${today.getFullYear()}年${today.getMonth() + 1}月${today.getDate()}日 · 课内10分钟 + Lesson ${lesson.number} 5分钟`;
-  elements.outsideTask.textContent = `新概念英语第二册 · Lesson ${lesson.number}`;
-  elements.lessonNum.textContent = `Lesson ${lesson.number}`;
-  elements.weekRange.textContent = `${localDate(lesson.start)} ～ ${localDate(lesson.end)}`;
-  elements.packMonth.value = currentMonth;
+  let recorder, stream, chunks = [], elapsed = 0, startedAt = 0, tick, paused = false, audioUrl, latestRecording, activeSession, sealedSession;
+  const screenWakeLock = new WakeLockController(navigator);
+  const current = () => ({ now: new Date(), context: dateContext(new Date()) });
+  const refreshToday = () => {
+    const { now, context } = current(), lesson = lessonForDate(now), record = meta[context.key];
+    elements.todayText.textContent = `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日 · 课内10分钟 + Lesson ${lesson.number} 5分钟`;
+    elements.outsideTask.textContent = `新概念英语第二册 · Lesson ${lesson.number}`;
+    elements.lessonNum.textContent = `Lesson ${lesson.number}`;
+    elements.weekRange.textContent = `${localDate(lesson.start)} ～ ${localDate(lesson.end)}`;
+    elements.lessonProgress.value = record?.lessonProgress || '';
+    elements.readCount.value = record?.readCount || '';
+    elements.note.value = record?.note || '';
+    if (record?.done) elements.status.textContent = '今日已完成';
+    return { context, lesson };
+  };
+  elements.packMonth.value = dateContext(new Date()).month;
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { elements.secureWarn.classList.remove('hidden'); elements.start.disabled = true; }
-  if (meta[todayKey]) { elements.lessonProgress.value = meta[todayKey].lessonProgress || ''; elements.readCount.value = meta[todayKey].readCount || ''; elements.note.value = meta[todayKey].note || ''; if (meta[todayKey].done) elements.status.textContent = '今日已完成'; }
+  refreshToday();
   const updateTimer = () => { const phase = phaseForSeconds(elapsed); elements.timer.textContent = formatTime(elapsed); elements.bar.style.width = `${Math.min(100, elapsed / secondsPerDay * 100)}%`; elements.phase.textContent = phase.label; };
-  const saveMeta = (done) => { meta[todayKey] = { ...(meta[todayKey] || {}), done: Boolean(done), seconds: elapsed, lessonNumber: lesson.number, lessonProgress: elements.lessonProgress.value.trim(), readCount: elements.readCount.value ? Number(elements.readCount.value) : '', note: elements.note.value.trim() }; localStorage.setItem(META_KEY, JSON.stringify(meta)); elements.status.textContent = done ? '今日已完成' : '已保存'; renderCalendar(); renderMonthList(); };
-  const renderCalendar = () => { const year = today.getFullYear(), month = today.getMonth(); elements.calendar.innerHTML = ''; for (let blank = 0; blank < new Date(year, month, 1).getDay(); blank += 1) elements.calendar.append(document.createElement('div')); for (let day = 1; day <= new Date(year, month + 1, 0).getDate(); day += 1) { const key = `${year}-${pad(month + 1)}-${pad(day)}`, cell = document.createElement('div'); cell.className = `day${meta[key]?.done ? ' done' : ''}`; cell.innerHTML = `<b>${day}</b><span>${meta[key]?.done ? '✅' : '—'}</span>`; elements.calendar.append(cell); } };
-  async function renderMonthList() { const audio = await monthlyAudio(currentMonth), byDate = Object.fromEntries(audio.map((record) => [record.date, record])); const keys = [...new Set([...Object.keys(meta).filter((key) => key.startsWith(currentMonth)), ...audio.map((record) => record.date)])].sort(); elements.monthList.innerHTML = keys.length ? keys.map((key) => { const record = meta[key] || {}, file = byDate[key]; return `<div class="list-row"><b>${key}</b> ${record.done ? '✅' : '⚠️'} · ${Math.floor((record.seconds || file?.seconds || 0) / 60)}分${(record.seconds || file?.seconds || 0) % 60}秒<br>${file ? `🎙 ${file.filename}` : '尚无录音文件'}</div>`; }).join('') : '暂无记录'; }
-  elements.start.addEventListener('click', async () => { try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); const mime = preferredMime(); recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream); chunks = []; recorder.addEventListener('dataavailable', (event) => { if (event.data.size) chunks.push(event.data); }); recorder.addEventListener('stop', async () => { const actualMime = recorder.mimeType || mime || 'audio/webm', blob = new Blob(chunks, { type: actualMime }), filename = `${todayKey}_英语15分钟.${extensionFor(actualMime)}`; if (audioUrl) URL.revokeObjectURL(audioUrl); audioUrl = URL.createObjectURL(blob); elements.player.src = audioUrl; elements.player.classList.remove('hidden'); await saveAudio({ date: todayKey, filename, mime: actualMime, blob, seconds: elapsed }); meta[todayKey] = { ...(meta[todayKey] || {}), audioFilename: filename, audioFormat: actualMime }; localStorage.setItem(META_KEY, JSON.stringify(meta)); elements.downloadAudio.href = audioUrl; elements.downloadAudio.download = filename; elements.fileInfo.textContent = `${filename} · ${Math.round(blob.size / 1024)}KB · ${actualMime}`; elements.saveBox.classList.remove('hidden'); renderMonthList(); }); recorder.start(); startedAt = Date.now() - elapsed * 1000; tick = setInterval(() => { elapsed = Math.floor((Date.now() - startedAt) / 1000); updateTimer(); }, 500); elements.start.disabled = true; elements.pause.disabled = false; elements.stop.disabled = false; elements.status.textContent = '录音中'; } catch (error) { alert(`无法启动麦克风：${error.message || error}`); } });
-  elements.pause.addEventListener('click', () => { if (!recorder) return; if (!paused) { recorder.pause(); clearInterval(tick); paused = true; elements.pause.textContent = '继续'; } else { recorder.resume(); startedAt = Date.now() - elapsed * 1000; tick = setInterval(() => { elapsed = Math.floor((Date.now() - startedAt) / 1000); updateTimer(); }, 500); paused = false; elements.pause.textContent = '暂停'; } });
-  elements.stop.addEventListener('click', () => { if (recorder?.state !== 'inactive') recorder.stop(); clearInterval(tick); stream?.getTracks().forEach((track) => track.stop()); elements.start.disabled = false; elements.pause.disabled = true; elements.stop.disabled = true; saveMeta(elapsed >= secondsPerDay); });
-  elements.saveRecord.addEventListener('click', () => { saveMeta(meta[todayKey]?.done || elapsed >= secondsPerDay); alert('今日记录已保存。'); });
-  elements.exportCsv.addEventListener('click', () => download(new Blob([csvFor(currentMonth, meta)], { type: 'text/csv;charset=utf-8' }), `${currentMonth}_英语录音记录.csv`));
-  elements.packBtn.addEventListener('click', async () => { const month = elements.packMonth.value; elements.packStatus.textContent = '正在生成 ZIP…'; try { const audio = await monthlyAudio(month), selected = Object.fromEntries(Object.entries(meta).filter(([key]) => key.startsWith(month))); const files = audio.map((record) => ({ name: `audio/${record.filename}`, blob: record.blob })); files.push({ name: 'record.csv', blob: new Blob([csvFor(month, meta)], { type: 'text/csv;charset=utf-8' }) }, { name: 'record.json', blob: new Blob([JSON.stringify(selected, null, 2)], { type: 'application/json' }) }); download(await zip(files), `${month}_英语录音打包.zip`); elements.packStatus.textContent = `已生成 ZIP，包含录音 ${audio.length} 个。`; } catch (error) { elements.packStatus.textContent = `打包失败：${error.message || error}`; } });
-  renderCalendar(); renderMonthList(); updateTimer();
+  const setRecordingState = (state) => { const next = recordingStatus(state); elements.recordingState.textContent = next.text; elements.recordingState.dataset.tone = next.tone; elements.status.textContent = next.text; };
+  const saveMeta = (date, lessonNumber, done, seconds = elapsed) => { meta[date] = { ...(meta[date] || {}), done: Boolean(done), seconds, lessonNumber, lessonProgress: elements.lessonProgress.value.trim(), readCount: elements.readCount.value ? Number(elements.readCount.value) : '', note: elements.note.value.trim() }; localStorage.setItem(META_KEY, JSON.stringify(meta)); elements.status.textContent = done ? '今日已完成' : '已保存'; renderCalendar(); renderMonthList(); };
+  const renderCalendar = () => { const now = new Date(), year = now.getFullYear(), month = now.getMonth(); elements.calendar.innerHTML = ''; for (let blank = 0; blank < new Date(year, month, 1).getDay(); blank += 1) elements.calendar.append(document.createElement('div')); for (let day = 1; day <= new Date(year, month + 1, 0).getDate(); day += 1) { const key = `${year}-${pad(month + 1)}-${pad(day)}`, cell = document.createElement('div'); cell.className = `day${meta[key]?.done ? ' done' : ''}`; cell.innerHTML = `<b>${day}</b><span>${meta[key]?.done ? '✅' : '—'}</span>`; elements.calendar.append(cell); } };
+  async function renderMonthList() { const month = dateContext(new Date()).month, audio = await monthlyAudio(month), byDate = Object.fromEntries(audio.map((record) => [record.date, record])); const keys = [...new Set([...Object.keys(meta).filter((key) => key.startsWith(month)), ...audio.map((record) => record.date)])].sort(); elements.monthList.innerHTML = keys.length ? keys.map((key) => { const record = meta[key] || {}, file = byDate[key], seconds = Number(record.seconds || file?.seconds || 0); return `<div class="list-row"><b>${key}</b> ${record.done ? '✅' : '⚠️'} · ${Math.floor(seconds / 60)}分${seconds % 60}秒<br>${file ? `🎙 ${file.filename}` : '尚无录音文件'}</div>`; }).join('') : '暂无记录'; }
+  elements.start.addEventListener('click', async () => { const now = new Date(), lesson = lessonForDate(now); activeSession = createRecordingSession(now, lesson.number); try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); const mime = preferredMime(); recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream); chunks = []; recorder.addEventListener('dataavailable', (event) => { if (event.data.size) chunks.push(event.data); }); recorder.addEventListener('stop', async () => { const session = sealedSession; if (!session) return; const actualMime = recorder.mimeType || mime || 'audio/webm', blob = new Blob(chunks, { type: actualMime }), filename = recordingFilename(session.date, actualMime); if (audioUrl) URL.revokeObjectURL(audioUrl); audioUrl = URL.createObjectURL(blob); latestRecording = { blob, filename, mime: actualMime }; elements.player.src = audioUrl; elements.player.classList.remove('hidden'); await saveAudio({ date: session.date, filename, mime: actualMime, blob, seconds: session.seconds }); meta[session.date] = { ...(meta[session.date] || {}), audioFilename: filename, audioFormat: actualMime }; localStorage.setItem(META_KEY, JSON.stringify(meta)); elements.fileInfo.textContent = `${filename} · ${Math.round(blob.size / 1024)}KB · ${actualMime}`; elements.saveBox.classList.remove('hidden'); saveMeta(session.date, session.lessonNumber, session.seconds >= secondsPerDay, session.seconds); stream?.getTracks().forEach((track) => track.stop()); sealedSession = undefined; activeSession = undefined; elements.start.disabled = false; setRecordingState('saved'); }); recorder.start(); await screenWakeLock.acquire(); startedAt = Date.now(); tick = setInterval(() => { elapsed = Math.floor((Date.now() - startedAt) / 1000); updateTimer(); }, 500); elements.start.disabled = true; elements.pause.disabled = false; elements.stop.disabled = false; setRecordingState('recording'); } catch (error) { activeSession = undefined; alert(`无法启动麦克风：${error.message || error}`); } });
+  elements.pause.addEventListener('click', async () => { if (!recorder) return; if (!paused) { recorder.pause(); clearInterval(tick); await screenWakeLock.release(); paused = true; elements.pause.textContent = '继续'; setRecordingState('paused'); } else { recorder.resume(); await screenWakeLock.acquire(); startedAt = Date.now() - elapsed * 1000; tick = setInterval(() => { elapsed = Math.floor((Date.now() - startedAt) / 1000); updateTimer(); }, 500); paused = false; elements.pause.textContent = '暂停'; setRecordingState('recording'); } });
+  elements.stop.addEventListener('click', async () => { if (recorder?.state === 'inactive' || !activeSession) return; sealedSession = sealRecordingSession(activeSession, elapsed); elapsed = finishRecordingSession(sealedSession.seconds).nextElapsed; clearInterval(tick); updateTimer(); await screenWakeLock.release(); elements.pause.disabled = true; elements.stop.disabled = true; setRecordingState('saving'); recorder.stop(); });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { refreshToday(); renderCalendar(); renderMonthList(); if (recorder?.state === 'recording' && !paused) screenWakeLock.acquire(); } });
+  const saveToFiles = async (blob, filename, type) => {
+    if (typeof File !== 'function') return download(blob, filename);
+    const file = new File([blob], filename, { type });
+    return shareFile(file, navigator, () => download(blob, filename));
+  };
+  elements.saveRecord.addEventListener('click', () => { const { context, lesson } = refreshToday(); saveMeta(context.key, lesson.number, meta[context.key]?.done || elapsed >= secondsPerDay); alert('今日记录已保存。'); });
+  elements.exportCsv.addEventListener('click', async () => {
+    const month = dateContext(new Date()).month; await saveToFiles(new Blob([csvFor(month, meta)], { type: 'text/csv;charset=utf-8' }), `${month}_英语录音记录.csv`, 'text/csv;charset=utf-8');
+  });
+  elements.downloadAudio.addEventListener('click', async (event) => {
+    event.preventDefault();
+    if (!latestRecording) return;
+    try {
+      await saveToFiles(latestRecording.blob, latestRecording.filename, latestRecording.mime);
+    } catch (error) {
+      alert(`无法打开“存储到文件”：${error.message || error}`);
+    }
+  });
+  elements.packBtn.addEventListener('click', async () => { const month = elements.packMonth.value; elements.packStatus.textContent = '正在生成 ZIP…'; try { const audio = await monthlyAudio(month), selected = Object.fromEntries(Object.entries(meta).filter(([key]) => key.startsWith(month))); const files = audio.map((record) => ({ name: `audio/${record.filename}`, blob: record.blob })); files.push({ name: 'record.csv', blob: new Blob([csvFor(month, meta)], { type: 'text/csv;charset=utf-8' }) }, { name: 'record.json', blob: new Blob([JSON.stringify(selected, null, 2)], { type: 'application/json' }) }); await saveToFiles(await zip(files), `${month}_英语录音打包.zip`, 'application/zip'); elements.packStatus.textContent = `已打开存储面板，包含录音 ${audio.length} 个。`; } catch (error) { elements.packStatus.textContent = `打包失败：${error.message || error}`; } });
+  (async () => { meta = await repairLegacyRecords(meta); refreshToday(); renderCalendar(); renderMonthList(); updateTimer(); })();
   if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('./service-worker.js').catch(() => {}));
 }
 

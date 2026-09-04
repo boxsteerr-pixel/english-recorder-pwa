@@ -1,4 +1,4 @@
-const CACHE_NAME = 'english-recorder-pwa-v1';
+const CACHE_NAME = 'english-recorder-pwa-v6';
 const SHELL = ['./', './index.html', './app.js', './manifest.webmanifest', './icons/icon.svg'];
 
 self.addEventListener('install', (event) => {
